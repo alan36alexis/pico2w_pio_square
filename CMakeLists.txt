@@ -1,13 +1,8 @@
-# Generated Cmake Pico project file
-
 cmake_minimum_required(VERSION 3.13)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-
-# Initialise pico_sdk from installed location
-# (note this can come from environment, CMake cache etc)
 
 # == DO NOT EDIT THE FOLLOWING LINES for the Raspberry Pi Pico VS Code Extension to work ==
 if(WIN32)
@@ -25,38 +20,37 @@ endif()
 # ====================================================================================
 set(PICO_BOARD pico2_w CACHE STRING "Board type")
 
-# Pull in Raspberry Pi Pico SDK (must be before project)
+# Importar Raspberry Pi Pico SDK (debe ser antes de project())
 include(pico_sdk_import.cmake)
 
-project(hello_pio C CXX ASM)
+project(pico2w_pio_square C CXX ASM)
 
-# Initialise the Raspberry Pi Pico SDK
+# Inicializar Raspberry Pi Pico SDK
 pico_sdk_init()
 
-# Add executable. Default name is the project name, version 0.1
+add_executable(${PROJECT_NAME})
 
-add_executable(hello_pio)
+pico_generate_pio_header(${PROJECT_NAME} ${CMAKE_CURRENT_LIST_DIR}/stepgen.pio)
 
-pico_generate_pio_header(hello_pio ${CMAKE_CURRENT_LIST_DIR}/hello.pio)
+target_sources(${PROJECT_NAME} PRIVATE stepgen.c)
 
-target_sources(hello_pio PRIVATE hello.c)
-
-target_link_libraries(hello_pio PRIVATE
-        pico_stdlib
-        hardware_pio
-        )
+target_link_libraries(${PROJECT_NAME} PRIVATE
+    pico_stdlib
+    hardware_dma
+    hardware_irq
+    hardware_pio
+    m
+)
 
 # Habilitar stdio por UART y deshabilitar USB
-pico_enable_stdio_uart(hello_pio 1)
-pico_enable_stdio_usb(hello_pio 0)
+pico_enable_stdio_uart(${PROJECT_NAME} 1)
+pico_enable_stdio_usb(${PROJECT_NAME} 0)
 
-# Pass cmake -DHELLO_PIO_LED_PIN=x, where x is the pin you want to use
-if(HELLO_PIO_LED_PIN)
-        target_compile_definitions(hello_pio PRIVATE
-                HELLO_PIO_LED_PIN=${HELLO_PIO_LED_PIN}
-        )
+# Pin de salida STEP: cmake -DSTEPGEN_PIN=<gpio>
+if(STEPGEN_PIN)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE
+        STEPGEN_PIN=${STEPGEN_PIN}
+    )
 endif()
 
-pico_add_extra_outputs(hello_pio)
-
-# add url via pico_set_program_url
+pico_add_extra_outputs(${PROJECT_NAME})

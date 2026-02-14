@@ -5,7 +5,22 @@
 ;
 .pio_version 0 // only requires PIO version 0
 
-.program hello
+.program stepgen
+
+; Genera una onda cuadrada leyendo tiempos en alto/bajo por FIFO en cada ciclo (pensado para DMA)
+public dma_stream:
+    pull block      ; Recibir tiempo en alto
+    mov y, osr
+    set pins, 1
+dma_high:
+    jmp y-- dma_high
+
+    pull block      ; Recibir tiempo en bajo
+    mov y, osr
+    set pins, 0
+dma_low:
+    jmp y-- dma_low
+    jmp dma_stream
 
 ; Genera una onda cuadrada continua
 public infinite:
@@ -44,20 +59,18 @@ bur_low:
     jmp x-- burst_loop
 
 % c-sdk {
-static inline void hello_program_init(PIO pio, uint sm, uint offset, uint pin) {
-    pio_sm_config c = hello_program_get_default_config(offset);
+static inline void stepgen_program_init(PIO pio, uint sm, uint offset, uint pin) {
+    pio_sm_config c = stepgen_program_get_default_config(offset);
 
-    // Map the state machine's SET pin group to one pin, namely the `pin`
-    // parameter to this function.
+    // Asigna el grupo de pines SET a 1 pin (salida de pulsos).
     sm_config_set_set_pins(&c, pin, 1);
-    // Set this pin's GPIO function (connect PIO to the pad)
+    // Conecta el PIO al pad GPIO
     pio_gpio_init(pio, pin);
-    // Set the pin direction to output at the PIO
+    // Dirección de salida
     pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, true);
 
-    // Load our configuration, and jump to the start of the program
+    // Carga la configuración y arranca la SM
     pio_sm_init(pio, sm, offset, &c);
-    // Set the state machine running
     pio_sm_set_enabled(pio, sm, true);
 }
 %}
