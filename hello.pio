@@ -1,0 +1,63 @@
+;
+; Copyright (c) 2020 Raspberry Pi (Trading) Ltd.
+;
+; SPDX-License-Identifier: BSD-3-Clause
+;
+.pio_version 0 // only requires PIO version 0
+
+.program hello
+
+; Genera una onda cuadrada continua
+public infinite:
+    pull block      ; Recibir tiempo en alto
+    mov isr, osr    ; Guardar en ISR
+    pull block      ; Recibir tiempo en bajo
+inf_loop:
+    mov y, isr      ; Cargar tiempo alto
+    set pins, 1     ; Pin en Alto
+inf_high:
+    jmp y-- inf_high
+
+    mov y, osr      ; Cargar tiempo bajo
+    set pins, 0     ; Pin en Bajo
+inf_low:
+    jmp y-- inf_low
+    jmp inf_loop
+
+; Genera una ráfaga (burst) de N ciclos
+public burst:
+    pull block      ; Recibir cantidad de ciclos (N-1)
+    mov x, osr      ; Guardar en X
+    pull block      ; Recibir tiempo en alto
+    mov isr, osr    ; Guardar en ISR
+    pull block      ; Recibir tiempo en bajo
+burst_loop:
+    mov y, isr      ; Cargar tiempo alto
+    set pins, 1     ; Pin en Alto
+bur_high:
+    jmp y-- bur_high
+
+    mov y, osr      ; Cargar tiempo bajo
+    set pins, 0     ; Pin en Bajo
+bur_low:
+    jmp y-- bur_low
+    jmp x-- burst_loop
+
+% c-sdk {
+static inline void hello_program_init(PIO pio, uint sm, uint offset, uint pin) {
+    pio_sm_config c = hello_program_get_default_config(offset);
+
+    // Map the state machine's SET pin group to one pin, namely the `pin`
+    // parameter to this function.
+    sm_config_set_set_pins(&c, pin, 1);
+    // Set this pin's GPIO function (connect PIO to the pad)
+    pio_gpio_init(pio, pin);
+    // Set the pin direction to output at the PIO
+    pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, true);
+
+    // Load our configuration, and jump to the start of the program
+    pio_sm_init(pio, sm, offset, &c);
+    // Set the state machine running
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}
