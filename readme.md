@@ -1,6 +1,4 @@
 --- /dev/null
-+++ /home/alanvel/Documents/Proyecto Final/repos_proyecto/pico2w_pio_square/README.md
-@@ -0,0 +1,98 @@
 +# Pico PIO Step Generator (S-Curve DMA)
 +
 +Este proyecto implementa un generador de pulsos de alta precisión para el control de motores paso a paso (steppers) utilizando el **PIO (Programmable I/O)** y **DMA (Direct Memory Access)** del microcontrolador RP2040 (Raspberry Pi Pico).
