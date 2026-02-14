@@ -1,33 +1,42 @@
---- /dev/null
-+# Pico PIO Step Generator (S-Curve DMA)
++# Pico 2W PIO Square Wave Generator
 +
-+Este proyecto implementa un generador de pulsos de alta precisión para el control de motores paso a paso (steppers) utilizando el **PIO (Programmable I/O)** y **DMA (Direct Memory Access)** del microcontrolador RP2040 (Raspberry Pi Pico).
++Este proyecto implementa un generador de ondas cuadradas de alta precisión utilizando el **PIO (Programmable I/O)** y **DMA (Direct Memory Access)** del microcontrolador RP2350 (Raspberry Pi Pico 2W).
 +
-+El objetivo principal es generar perfiles de movimiento suaves (aceleración y desaceleración en **Curva S**) sin ocupar tiempo de procesamiento de la CPU principal.
++El objetivo principal es generar patrones de ondas cuadradas con tiempos configurables sin ocupar tiempo de procesamiento de la CPU principal, permitiendo que ésta se dedique a otras tareas o entre en modo bajo consumo.
 +
 +## Características
 +
-+*   **Descarga de CPU (Zero-CPU overhead):** Una vez configurada la rampa, el movimiento es gestionado enteramente por el controlador DMA y las máquinas de estado PIO. La CPU puede dormir o realizar otras tareas.
-+*   **Perfil de Movimiento en Curva S:** Implementa la función `smoothstep` para calcular rampas de aceleración suaves, reduciendo la vibración y el estrés mecánico en el motor.
-+*   **Alta Precisión:** La generación de pulsos se basa en ciclos de reloj del sistema (`clk_sys`), permitiendo resoluciones de nanosegundos.
-+*   **Modos de Operación:**
-+    *   **DMA Stream:** Generación continua con rampas de entrada y salida.
-+    *   **Burst Mode:** Generación de una cantidad exacta de pulsos (útil para posicionamiento preciso).
-+    *   **Infinite Mode:** Generación de frecuencia constante.
++*   **Descarga de CPU (Zero-CPU overhead):** Una vez iniciada la generación de ondas, ésta es gestionada enteramente por el controlador DMA y las máquinas de estado PIO. La CPU puede dormir o realizar otras tareas.
++*   **Tres Modos de Operación:**
++    *   **DMA Stream:** Lectura continua de tiempos desde DMA para patrones dinámicos.
++    *   **Infinite Mode:** Generación de onda cuadrada con periodo constante.
++    *   **Burst Mode:** Generación de N pulsos exactos con tiempos configurables.
++*   **Alta Precisión:** La generación de pulsos se basa en ciclos de reloj del sistema (`clk_sys`), permitiendo resoluciones muy precisas.
++*   **Compatible con RP2350:** Optimizado para el Pico 2W con soporte para múltiples máquinas de estado PIO.
 +
 +## Estructura del Proyecto
 +
-+*   **`stepgen.pio`**: Código ensamblador del PIO. Define cómo la máquina de estado interpreta los datos del FIFO para alternar el pin de salida (STEP).
++*   **`stepgen.pio`**: Código ensamblador del PIO. Define tres programas de máquina de estado:
++    *   `dma_stream`: Lectura continua de pares (alto, bajo) desde el FIFO.
++    *   `infinite`: Onda cuadrada con período constante.
++    *   `burst`: Generación de N pulsos exactos.
 +*   **`stepgen.c`**: Lógica principal en C.
-+    *   Cálculo de tablas de tiempos para la curva S.
-+    *   Configuración de canales DMA (encadenamiento de rampa -> velocidad constante).
-+    *   Manejo de interrupciones para detención suave.
++    *   Inicialización del PIO y configuración de máquinas de estado.
++    *   Configuración de canales DMA para alimentar datos al PIO.
++    *   Cálculo de tiempos de pulso y patrones.
++    *   Manejo de interrupciones (opcional).
 +
 +## Configuración de Hardware
 +
-+Por defecto, el proyecto está configurado para usar el **GPIO 16** como salida de pulsos (STEP).
++Por defecto, el proyecto está configurado para usar el **GPIO 16** como salida de la onda cuadrada.
 +
-+Para cambiar el pin, puedes definir `STEPGEN_PIN` antes de compilar o modificar la línea en `stepgen.c`:
++Para cambiar el pin, puedes definir `STEPGEN_PIN` durante la compilación con CMake:
++
++```bash
++cmake -DSTEPGEN_PIN=<número> ..
++```
++
++O modificar la línea en `stepgen.c`:
 +
 +```c
 +#if !defined(STEPGEN_PIN)
@@ -37,63 +46,70 @@
 +
 +## Compilación
 +
-+Este proyecto utiliza el estándar **Pico SDK**.
++Este proyecto utiliza el **Pico SDK** y **CMake**.
 +
-+1.  Asegúrate de tener el entorno del Pico SDK configurado.
-+2.  Crea el directorio de construcción:
++1.  Asegúrate de tener la cadena de herramientas ARM Cortex-M y el Pico SDK instalados.
++2.  Navega a la carpeta del proyecto y crea la carpeta de construcción:
 +    ```bash
 +    mkdir build
 +    cd build
 +    ```
-+3.  Ejecuta CMake y Make:
++3.  Ejecuta CMake y Ninja (o Make):
 +    ```bash
 +    cmake ..
++    ninja
++    ```
++    O con Make:
++    ```bash
 +    make
 +    ```
++4.  El binario se genera en `build/pico2w_pio_square.uf2`.
 +
 +## Uso de la API
 +
 +### Inicialización
 +
-+El sistema se inicializa automáticamente en `main()`, configurando el PIO y reservando canales DMA.
-+
-+### Movimiento con Rampa (DMA)
-+
-+Para iniciar un movimiento con aceleración suave:
++El sistema se inicializa automáticamente en `main()`, configurando el PIO y reservando canales DMA:
 +
 +```c
-+// Inicia en 10 Hz, acelera hasta 1 kHz, 50% duty cycle, rampa de 128 pasos
-+stepgen_start_s_curve_dma(10.0f, 1000.0f, 0.5f, 128u);
++stepgen_init();  // Inicializa PIO y DMA
 +```
 +
-+*   **`freq_start_hz`**: Frecuencia inicial.
-+*   **`freq_target_hz`**: Frecuencia objetivo (velocidad crucero).
-+*   **`duty_cycle`**: Ciclo de trabajo (usualmente 0.5).
-+*   **`ramp_steps`**: Cantidad de pasos discretos para construir la curva de aceleración.
++### Modo Infinite (Onda Cuadrada Continua)
 +
-+### Detención
-+
-+Para detener el motor suavemente (desaceleración):
++Para generar una onda cuadrada de período constante:
 +
 +```c
-+// Desacelera desde la velocidad actual hasta 10 Hz en 128 pasos y se detiene
-+stepgen_stop_s_curve_dma(10.0f, 128u);
++// Tiempo alto: 100 ciclos, Tiempo bajo: 100 ciclos
++stepgen_infinite_wave(100u, 100u);
 +```
 +
-+### Funciones Bloqueantes (Test)
++### Modo DMA Stream (Patrón Dinámico)
 +
-+Existen funciones auxiliares que no usan DMA, útiles para pruebas rápidas o movimientos simples donde no importa bloquear la CPU:
++Para enviar patrones dinámicos a través de DMA:
 +
-+*   `stepgen_square_wave_ms(...)`
-+*   `stepgen_square_wave_us(...)`
-+*   `stepgen_burst_us(...)` (Genera N pulsos y se detiene)
++```c
++uint32_t pattern[4] = {100, 100, 50, 150};  // [alto0, bajo0, alto1, bajo1]
++stepgen_dma_stream(pattern, 2);  // 2 ciclos
++```
++
++### Modo Burst (N Pulsos Exactos)
++
++Para generar una cantidad exacta de pulsos:
++
++```c
++stepgen_burst_pulses(10, 100u, 100u);  // 10 pulsos, 100 ciclos alto y bajo
++```
 +
 +## Funcionamiento Técnico (PIO + DMA)
 +
-+1.  **Cálculo:** La CPU pre-calcula los tiempos de encendido (High) y apagado (Low) para cada paso de la rampa y los guarda en un buffer (`g_ramp_buf`).
-+2.  **DMA Rampa:** Un canal DMA envía estos tiempos al FIFO del PIO.
-+3.  **DMA Steady:** Al terminar la rampa, el DMA encadena automáticamente a un segundo canal (`dma_steady_ch`) que alimenta al PIO con la velocidad constante de forma circular.
-+4.  **PIO:** La máquina de estado toma los valores de tiempo, enciende el pin, espera los ciclos indicados, apaga el pin, espera y repite.
++1.  **Cálculo:** La CPU pre-calcula los tiempos (alto y bajo) para generar los patrones deseados y los guarda en buffers en RAM.
++2.  **DMA:** El controlador DMA transfiere automáticamente estos tiempos al FIFO del PIO, liberando a la CPU.
++3.  **PIO:** Las máquinas de estado PIO leen los tiempos del FIFO, alternan el pin de salida, esperan los ciclos indicados, y repiten el proceso.
++4.  **Modos:**
++    *   En **Infinite Mode**, la máquina de estado repite indefinidamente con período constante.
++    *   En **DMA Stream**, el DMA alimenta continuamente pares (alto, bajo) para formar patrones complejos.
++    *   En **Burst Mode**, se genera un número exacto de pulsos y se detiene.
 +
 +---
-+Autor: [Tu Nombre/Organización]
++Autor: Alan Velazquez
