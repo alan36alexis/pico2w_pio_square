@@ -15,6 +15,10 @@
 #error STEPGEN_PIN debe ser < NUM_BANK0_GPIOS
 #endif
 
+#ifndef STEPGEN_DMA_MAX_STEPS
+#define STEPGEN_DMA_MAX_STEPS 256u
+#endif
+
 typedef struct {
     PIO pio;
     uint sm;
@@ -29,17 +33,15 @@ typedef struct {
     float freq_start_hz;
     float freq_target_hz;
     uint ramp_steps;
-} stepgen_dma_ctx_t;
 
-static stepgen_dma_ctx_t g_stepgen = {0};
+    // Buffers propios para cada instancia
+    uint32_t ramp_buf[2u * STEPGEN_DMA_MAX_STEPS];
+    uint32_t stop_buf[2u * STEPGEN_DMA_MAX_STEPS];
+    uint32_t steady_buf[2];
+} stepgen_t;
 
-// Buffers: [alto0, bajo0, alto1, bajo1, ...]
-#ifndef STEPGEN_DMA_MAX_STEPS
-#define STEPGEN_DMA_MAX_STEPS 256u
-#endif
-static uint32_t g_ramp_buf[2u * STEPGEN_DMA_MAX_STEPS];
-static uint32_t g_stop_buf[2u * STEPGEN_DMA_MAX_STEPS];
-static uint32_t g_steady_buf[2] = {0, 0};
+// Mapa para enrutar interrupciones DMA a la instancia correcta
+static stepgen_t *g_dma_ctx_map[NUM_DMA_CHANNELS] = {NULL};
 
 static inline float smoothstep(float t) {
     if (t <= 0.0f) return 0.0f;
@@ -105,55 +107,66 @@ static void build_constant_cycles_pair(uint32_t out_pair[2], float freq_hz, floa
 }
 
 static void stepgen_dma_irq0_handler(void) {
-    const uint32_t ints = dma_hw->ints0;
-    if (g_stepgen.dma_stop_ch >= 0 && (ints & (1u << (uint)g_stepgen.dma_stop_ch))) {
-        dma_hw->ints0 = 1u << (uint)g_stepgen.dma_stop_ch;
-        pio_sm_set_enabled(g_stepgen.pio, g_stepgen.sm, false);
-        pio_sm_set_pins(g_stepgen.pio, g_stepgen.sm, 0);
-        pio_sm_clear_fifos(g_stepgen.pio, g_stepgen.sm);
+    uint32_t ints = dma_hw->ints0;
+    
+    // Revisamos todos los canales activos para ver cuál disparó la IRQ
+    for (int ch = 0; ch < NUM_DMA_CHANNELS; ch++) {
+        if (ints & (1u << ch)) {
+            stepgen_t *ctx = g_dma_ctx_map[ch];
+            // Si este canal pertenece a una instancia y es su canal de parada:
+            if (ctx && ctx->dma_stop_ch == ch) {
+                dma_hw->ints0 = 1u << ch; // Limpiar flag
+                pio_sm_set_enabled(ctx->pio, ctx->sm, false);
+                pio_sm_set_pins(ctx->pio, ctx->sm, 0);
+                pio_sm_clear_fifos(ctx->pio, ctx->sm);
+            }
+        }
     }
 }
 
-static void stepgen_init(PIO pio, uint sm, uint offset, uint pin) {
-    g_stepgen.pio = pio;
-    g_stepgen.sm = sm;
-    g_stepgen.offset = offset;
-    g_stepgen.pin = pin;
+static void stepgen_init(stepgen_t *ctx, PIO pio, uint sm, uint offset, uint pin) {
+    ctx->pio = pio;
+    ctx->sm = sm;
+    ctx->offset = offset;
+    ctx->pin = pin;
 
-    g_stepgen.dma_ramp_ch = dma_claim_unused_channel(true);
-    g_stepgen.dma_steady_ch = dma_claim_unused_channel(true);
-    g_stepgen.dma_stop_ch = dma_claim_unused_channel(true);
+    ctx->dma_ramp_ch = dma_claim_unused_channel(true);
+    ctx->dma_steady_ch = dma_claim_unused_channel(true);
+    ctx->dma_stop_ch = dma_claim_unused_channel(true);
+
+    // Registrar esta instancia en el mapa global para la IRQ
+    g_dma_ctx_map[ctx->dma_stop_ch] = ctx;
 
     irq_set_exclusive_handler(DMA_IRQ_0, stepgen_dma_irq0_handler);
     irq_set_enabled(DMA_IRQ_0, true);
 }
 
-static void stepgen_start_s_curve_dma(float freq_start_hz, float freq_target_hz, float duty_cycle, uint ramp_steps) {
+static void stepgen_start_s_curve_dma(stepgen_t *ctx, float freq_start_hz, float freq_target_hz, float duty_cycle, uint ramp_steps) {
     if (ramp_steps > STEPGEN_DMA_MAX_STEPS) ramp_steps = STEPGEN_DMA_MAX_STEPS;
     if (ramp_steps < 2u) ramp_steps = 2u;
 
-    g_stepgen.freq_start_hz = freq_start_hz;
-    g_stepgen.freq_target_hz = freq_target_hz;
-    g_stepgen.duty_cycle = duty_cycle;
-    g_stepgen.ramp_steps = ramp_steps;
+    ctx->freq_start_hz = freq_start_hz;
+    ctx->freq_target_hz = freq_target_hz;
+    ctx->duty_cycle = duty_cycle;
+    ctx->ramp_steps = ramp_steps;
 
-    build_s_curve_cycles(g_ramp_buf, ramp_steps, freq_start_hz, freq_target_hz, duty_cycle);
-    build_constant_cycles_pair(g_steady_buf, freq_target_hz, duty_cycle); // 2 palabras (high/low)
+    build_s_curve_cycles(ctx->ramp_buf, ramp_steps, freq_start_hz, freq_target_hz, duty_cycle);
+    build_constant_cycles_pair(ctx->steady_buf, freq_target_hz, duty_cycle);
 
-    const uint dreq = pio_get_dreq(g_stepgen.pio, g_stepgen.sm, true);
-    volatile void *pio_txf = &g_stepgen.pio->txf[g_stepgen.sm];
+    const uint dreq = pio_get_dreq(ctx->pio, ctx->sm, true);
+    volatile void *pio_txf = &ctx->pio->txf[ctx->sm];
 
-    dma_channel_abort(g_stepgen.dma_ramp_ch);
-    dma_channel_abort(g_stepgen.dma_steady_ch);
-    dma_channel_abort(g_stepgen.dma_stop_ch);
+    dma_channel_abort(ctx->dma_ramp_ch);
+    dma_channel_abort(ctx->dma_steady_ch);
+    dma_channel_abort(ctx->dma_stop_ch);
 
-    pio_sm_set_enabled(g_stepgen.pio, g_stepgen.sm, false);
-    pio_sm_clear_fifos(g_stepgen.pio, g_stepgen.sm);
-    pio_sm_exec(g_stepgen.pio, g_stepgen.sm, pio_encode_jmp(g_stepgen.offset + stepgen_offset_dma_stream));
-    pio_sm_set_enabled(g_stepgen.pio, g_stepgen.sm, true);
+    pio_sm_set_enabled(ctx->pio, ctx->sm, false);
+    pio_sm_clear_fifos(ctx->pio, ctx->sm);
+    pio_sm_exec(ctx->pio, ctx->sm, pio_encode_jmp(ctx->offset + stepgen_offset_dma_stream));
+    pio_sm_set_enabled(ctx->pio, ctx->sm, true);
 
     // DMA steady: lectura circular de 2 words (alto/bajo) para pulsos indefinidos
-    dma_channel_config c_steady = dma_channel_get_default_config(g_stepgen.dma_steady_ch);
+    dma_channel_config c_steady = dma_channel_get_default_config(ctx->dma_steady_ch);
     channel_config_set_transfer_data_size(&c_steady, DMA_SIZE_32);
     channel_config_set_read_increment(&c_steady, true);
     channel_config_set_write_increment(&c_steady, false);
@@ -161,72 +174,72 @@ static void stepgen_start_s_curve_dma(float freq_start_hz, float freq_target_hz,
     // Ring en READ sobre 8 bytes = 2 words
     channel_config_set_ring(&c_steady, false /* write */, 3 /* 2^3 bytes */);
     dma_channel_configure(
-        g_stepgen.dma_steady_ch,
+        ctx->dma_steady_ch,
         &c_steady,
         pio_txf,
-        g_steady_buf,
+        ctx->steady_buf,
         0xffffffffu,
         false
     );
 
     // DMA de rampa: one-shot, y encadena a steady al terminar
-    dma_channel_config c_ramp = dma_channel_get_default_config(g_stepgen.dma_ramp_ch);
+    dma_channel_config c_ramp = dma_channel_get_default_config(ctx->dma_ramp_ch);
     channel_config_set_transfer_data_size(&c_ramp, DMA_SIZE_32);
     channel_config_set_read_increment(&c_ramp, true);
     channel_config_set_write_increment(&c_ramp, false);
     channel_config_set_dreq(&c_ramp, dreq);
-    channel_config_set_chain_to(&c_ramp, g_stepgen.dma_steady_ch);
+    channel_config_set_chain_to(&c_ramp, ctx->dma_steady_ch);
     dma_channel_configure(
-        g_stepgen.dma_ramp_ch,
+        ctx->dma_ramp_ch,
         &c_ramp,
         pio_txf,
-        g_ramp_buf,
+        ctx->ramp_buf,
         2u * ramp_steps,
         true
     );
 }
 
-static void stepgen_stop_s_curve_dma(float freq_end_hz, uint ramp_steps) {
+static void stepgen_stop_s_curve_dma(stepgen_t *ctx, float freq_end_hz, uint ramp_steps) {
     if (ramp_steps > STEPGEN_DMA_MAX_STEPS) ramp_steps = STEPGEN_DMA_MAX_STEPS;
     if (ramp_steps < 2u) ramp_steps = 2u;
 
     // Construir rampa de bajada: freq_target -> freq_end, y al final deshabilitar SM
     float f_end = freq_end_hz;
     if (f_end < 0.1f) f_end = 0.1f;
-    build_s_curve_cycles(g_stop_buf, ramp_steps, g_stepgen.freq_target_hz, f_end, g_stepgen.duty_cycle);
+    build_s_curve_cycles(ctx->stop_buf, ramp_steps, ctx->freq_target_hz, f_end, ctx->duty_cycle);
 
-    const uint dreq = pio_get_dreq(g_stepgen.pio, g_stepgen.sm, true);
-    volatile void *pio_txf = &g_stepgen.pio->txf[g_stepgen.sm];
+    const uint dreq = pio_get_dreq(ctx->pio, ctx->sm, true);
+    volatile void *pio_txf = &ctx->pio->txf[ctx->sm];
 
-    dma_channel_abort(g_stepgen.dma_ramp_ch);
-    dma_channel_abort(g_stepgen.dma_steady_ch);
-    dma_channel_abort(g_stepgen.dma_stop_ch);
+    dma_channel_abort(ctx->dma_ramp_ch);
+    dma_channel_abort(ctx->dma_steady_ch);
+    dma_channel_abort(ctx->dma_stop_ch);
 
     // Hacer que la rampa empiece "ya": limpiar FIFO y reiniciar el bucle del PIO
-    pio_sm_set_enabled(g_stepgen.pio, g_stepgen.sm, false);
-    pio_sm_clear_fifos(g_stepgen.pio, g_stepgen.sm);
-    pio_sm_exec(g_stepgen.pio, g_stepgen.sm, pio_encode_jmp(g_stepgen.offset + stepgen_offset_dma_stream));
-    pio_sm_set_enabled(g_stepgen.pio, g_stepgen.sm, true);
+    pio_sm_set_enabled(ctx->pio, ctx->sm, false);
+    pio_sm_clear_fifos(ctx->pio, ctx->sm);
+    pio_sm_exec(ctx->pio, ctx->sm, pio_encode_jmp(ctx->offset + stepgen_offset_dma_stream));
+    pio_sm_set_enabled(ctx->pio, ctx->sm, true);
 
-    dma_channel_set_irq0_enabled(g_stepgen.dma_stop_ch, true);
+    dma_channel_set_irq0_enabled(ctx->dma_stop_ch, true);
 
-    dma_channel_config c_stop = dma_channel_get_default_config(g_stepgen.dma_stop_ch);
+    dma_channel_config c_stop = dma_channel_get_default_config(ctx->dma_stop_ch);
     channel_config_set_transfer_data_size(&c_stop, DMA_SIZE_32);
     channel_config_set_read_increment(&c_stop, true);
     channel_config_set_write_increment(&c_stop, false);
     channel_config_set_dreq(&c_stop, dreq);
     dma_channel_configure(
-        g_stepgen.dma_stop_ch,
+        ctx->dma_stop_ch,
         &c_stop,
         pio_txf,
-        g_stop_buf,
+        ctx->stop_buf,
         2u * ramp_steps,
         true
     );
 }
 
 // Helpers bloqueantes (sin DMA). Útiles para pruebas rápidas.
-void stepgen_square_wave_ms(PIO pio, uint sm, uint offset, uint period_ms, float duty_cycle) {
+void stepgen_square_wave_ms(stepgen_t *ctx, uint period_ms, float duty_cycle) {
     const uint32_t sys_hz = clock_get_hz(clk_sys);
     const uint64_t total_cycles_64 = (uint64_t)period_ms * ((uint64_t)sys_hz / 1000u);
     const uint32_t total_cycles = clamp_u32(total_cycles_64, 3u, 0x7fffffffu);
@@ -236,17 +249,17 @@ void stepgen_square_wave_ms(PIO pio, uint sm, uint offset, uint period_ms, float
     split_total_cycles(total_cycles, duty_cycle, &high_cycles, &low_cycles);
 
     // Reiniciar y configurar para modo infinito
-    pio_sm_set_enabled(pio, sm, false);
-    pio_sm_clear_fifos(pio, sm);
-    pio_sm_exec(pio, sm, pio_encode_jmp(offset + stepgen_offset_infinite));
-    pio_sm_set_enabled(pio, sm, true);
+    pio_sm_set_enabled(ctx->pio, ctx->sm, false);
+    pio_sm_clear_fifos(ctx->pio, ctx->sm);
+    pio_sm_exec(ctx->pio, ctx->sm, pio_encode_jmp(ctx->offset + stepgen_offset_infinite));
+    pio_sm_set_enabled(ctx->pio, ctx->sm, true);
 
     // Enviar los tiempos al FIFO (High, luego Low)
-    pio_sm_put_blocking(pio, sm, high_cycles);
-    pio_sm_put_blocking(pio, sm, low_cycles);
+    pio_sm_put_blocking(ctx->pio, ctx->sm, high_cycles);
+    pio_sm_put_blocking(ctx->pio, ctx->sm, low_cycles);
 }
 
-void stepgen_square_wave_us(PIO pio, uint sm, uint offset, uint period_us, float duty_cycle) {
+void stepgen_square_wave_us(stepgen_t *ctx, uint period_us, float duty_cycle) {
     const uint32_t sys_hz = clock_get_hz(clk_sys);
     // Usamos uint64_t para evitar desbordamiento en la multiplicación
     const uint64_t total_cycles_64 = (uint64_t)period_us * (uint64_t)sys_hz / 1000000u;
@@ -256,16 +269,16 @@ void stepgen_square_wave_us(PIO pio, uint sm, uint offset, uint period_us, float
     uint32_t low_cycles = 0;
     split_total_cycles(total_cycles, duty_cycle, &high_cycles, &low_cycles);
 
-    pio_sm_set_enabled(pio, sm, false);
-    pio_sm_clear_fifos(pio, sm);
-    pio_sm_exec(pio, sm, pio_encode_jmp(offset + stepgen_offset_infinite));
-    pio_sm_set_enabled(pio, sm, true);
+    pio_sm_set_enabled(ctx->pio, ctx->sm, false);
+    pio_sm_clear_fifos(ctx->pio, ctx->sm);
+    pio_sm_exec(ctx->pio, ctx->sm, pio_encode_jmp(ctx->offset + stepgen_offset_infinite));
+    pio_sm_set_enabled(ctx->pio, ctx->sm, true);
 
-    pio_sm_put_blocking(pio, sm, high_cycles);
-    pio_sm_put_blocking(pio, sm, low_cycles);
+    pio_sm_put_blocking(ctx->pio, ctx->sm, high_cycles);
+    pio_sm_put_blocking(ctx->pio, ctx->sm, low_cycles);
 }
 
-void stepgen_square_wave_ns(PIO pio, uint sm, uint offset, uint period_ns, float duty_cycle) {
+void stepgen_square_wave_ns(stepgen_t *ctx, uint period_ns, float duty_cycle) {
     const uint32_t sys_hz = clock_get_hz(clk_sys);
     const uint64_t total_cycles_64 = (uint64_t)period_ns * (uint64_t)sys_hz / 1000000000u;
     const uint32_t total_cycles = clamp_u32(total_cycles_64, 3u, 0x7fffffffu);
@@ -274,16 +287,16 @@ void stepgen_square_wave_ns(PIO pio, uint sm, uint offset, uint period_ns, float
     uint32_t low_cycles = 0;
     split_total_cycles(total_cycles, duty_cycle, &high_cycles, &low_cycles);
 
-    pio_sm_set_enabled(pio, sm, false);
-    pio_sm_clear_fifos(pio, sm);
-    pio_sm_exec(pio, sm, pio_encode_jmp(offset + stepgen_offset_infinite));
-    pio_sm_set_enabled(pio, sm, true);
+    pio_sm_set_enabled(ctx->pio, ctx->sm, false);
+    pio_sm_clear_fifos(ctx->pio, ctx->sm);
+    pio_sm_exec(ctx->pio, ctx->sm, pio_encode_jmp(ctx->offset + stepgen_offset_infinite));
+    pio_sm_set_enabled(ctx->pio, ctx->sm, true);
 
-    pio_sm_put_blocking(pio, sm, high_cycles);
-    pio_sm_put_blocking(pio, sm, low_cycles);
+    pio_sm_put_blocking(ctx->pio, ctx->sm, high_cycles);
+    pio_sm_put_blocking(ctx->pio, ctx->sm, low_cycles);
 }
 
-void stepgen_burst_ms(PIO pio, uint sm, uint offset, uint count, uint period_ms, float duty_cycle) {
+void stepgen_burst_ms(stepgen_t *ctx, uint count, uint period_ms, float duty_cycle) {
     if (count == 0) return;
     const uint32_t sys_hz = clock_get_hz(clk_sys);
     const uint64_t total_cycles_64 = (uint64_t)period_ms * ((uint64_t)sys_hz / 1000u);
@@ -293,17 +306,17 @@ void stepgen_burst_ms(PIO pio, uint sm, uint offset, uint count, uint period_ms,
     uint32_t low_cycles = 0;
     split_total_cycles(total_cycles, duty_cycle, &high_cycles, &low_cycles);
 
-    pio_sm_set_enabled(pio, sm, false);
-    pio_sm_clear_fifos(pio, sm);
-    pio_sm_exec(pio, sm, pio_encode_jmp(offset + stepgen_offset_burst));
-    pio_sm_set_enabled(pio, sm, true);
+    pio_sm_set_enabled(ctx->pio, ctx->sm, false);
+    pio_sm_clear_fifos(ctx->pio, ctx->sm);
+    pio_sm_exec(ctx->pio, ctx->sm, pio_encode_jmp(ctx->offset + stepgen_offset_burst));
+    pio_sm_set_enabled(ctx->pio, ctx->sm, true);
 
-    pio_sm_put_blocking(pio, sm, count - 1); // N-1 porque el bucle es do-while
-    pio_sm_put_blocking(pio, sm, high_cycles);
-    pio_sm_put_blocking(pio, sm, low_cycles);
+    pio_sm_put_blocking(ctx->pio, ctx->sm, count - 1); // N-1 porque el bucle es do-while
+    pio_sm_put_blocking(ctx->pio, ctx->sm, high_cycles);
+    pio_sm_put_blocking(ctx->pio, ctx->sm, low_cycles);
 }
 
-void stepgen_burst_us(PIO pio, uint sm, uint offset, uint count, uint period_us, float duty_cycle) {
+void stepgen_burst_us(stepgen_t *ctx, uint count, uint period_us, float duty_cycle) {
     if (count == 0) return;
     const uint32_t sys_hz = clock_get_hz(clk_sys);
     const uint64_t total_cycles_64 = (uint64_t)period_us * (uint64_t)sys_hz / 1000000u;
@@ -313,17 +326,17 @@ void stepgen_burst_us(PIO pio, uint sm, uint offset, uint count, uint period_us,
     uint32_t low_cycles = 0;
     split_total_cycles(total_cycles, duty_cycle, &high_cycles, &low_cycles);
 
-    pio_sm_set_enabled(pio, sm, false);
-    pio_sm_clear_fifos(pio, sm);
-    pio_sm_exec(pio, sm, pio_encode_jmp(offset + stepgen_offset_burst));
-    pio_sm_set_enabled(pio, sm, true);
+    pio_sm_set_enabled(ctx->pio, ctx->sm, false);
+    pio_sm_clear_fifos(ctx->pio, ctx->sm);
+    pio_sm_exec(ctx->pio, ctx->sm, pio_encode_jmp(ctx->offset + stepgen_offset_burst));
+    pio_sm_set_enabled(ctx->pio, ctx->sm, true);
 
-    pio_sm_put_blocking(pio, sm, count - 1);
-    pio_sm_put_blocking(pio, sm, high_cycles);
-    pio_sm_put_blocking(pio, sm, low_cycles);
+    pio_sm_put_blocking(ctx->pio, ctx->sm, count - 1);
+    pio_sm_put_blocking(ctx->pio, ctx->sm, high_cycles);
+    pio_sm_put_blocking(ctx->pio, ctx->sm, low_cycles);
 }
 
-void stepgen_burst_ns(PIO pio, uint sm, uint offset, uint count, uint period_ns, float duty_cycle) {
+void stepgen_burst_ns(stepgen_t *ctx, uint count, uint period_ns, float duty_cycle) {
     if (count == 0) return;
     const uint32_t sys_hz = clock_get_hz(clk_sys);
     const uint64_t total_cycles_64 = (uint64_t)period_ns * (uint64_t)sys_hz / 1000000000u;
@@ -333,14 +346,14 @@ void stepgen_burst_ns(PIO pio, uint sm, uint offset, uint count, uint period_ns,
     uint32_t low_cycles = 0;
     split_total_cycles(total_cycles, duty_cycle, &high_cycles, &low_cycles);
 
-    pio_sm_set_enabled(pio, sm, false);
-    pio_sm_clear_fifos(pio, sm);
-    pio_sm_exec(pio, sm, pio_encode_jmp(offset + stepgen_offset_burst));
-    pio_sm_set_enabled(pio, sm, true);
+    pio_sm_set_enabled(ctx->pio, ctx->sm, false);
+    pio_sm_clear_fifos(ctx->pio, ctx->sm);
+    pio_sm_exec(ctx->pio, ctx->sm, pio_encode_jmp(ctx->offset + stepgen_offset_burst));
+    pio_sm_set_enabled(ctx->pio, ctx->sm, true);
 
-    pio_sm_put_blocking(pio, sm, count - 1);
-    pio_sm_put_blocking(pio, sm, high_cycles);
-    pio_sm_put_blocking(pio, sm, low_cycles);
+    pio_sm_put_blocking(ctx->pio, ctx->sm, count - 1);
+    pio_sm_put_blocking(ctx->pio, ctx->sm, high_cycles);
+    pio_sm_put_blocking(ctx->pio, ctx->sm, low_cycles);
 }
 
 int main(void) {
@@ -348,25 +361,30 @@ int main(void) {
     uint sm;
     uint offset;
 
+    // Instancia para el Motor 1
+    static stepgen_t motor1;
+
     setup_default_uart();
 
     // Carga el programa PIO y reclama una SM libre para el GPIO configurado
     bool success = pio_claim_free_sm_and_add_program_for_gpio_range(&stepgen_program, &pio, &sm, &offset, STEPGEN_PIN, 1, true);
     hard_assert(success);
 
-    printf("STEP pin: GPIO %d\n", STEPGEN_PIN);
+    printf("Motor 1 STEP pin: GPIO %d\n", STEPGEN_PIN);
     stepgen_program_init(pio, sm, offset, STEPGEN_PIN);
 
-    stepgen_init(pio, sm, offset, STEPGEN_PIN);
+    // Inicializamos la estructura del Motor 1
+    stepgen_init(&motor1, pio, sm, offset, STEPGEN_PIN);
 
-    printf("Iniciando STEPGEN por DMA en GPIO %d\n", STEPGEN_PIN);
+    printf("Iniciando Motor 1 por DMA...\n");
 
     // Prueba bloqueante (sin DMA):
-    // stepgen_square_wave_ns(pio, sm, offset, 100, 0.5f);
+    // stepgen_square_wave_ns(&motor1, 100, 0.5f);
+    
     // Ejemplo: pulsos infinitos por DMA con rampa S de arranque
-    stepgen_start_s_curve_dma(10.0f, 1000.0f, 0.5f, 128u);
+    stepgen_start_s_curve_dma(&motor1, 10.0f, 1000.0f, 0.5f, 128u);
     // Para detener: llamar cuando quieras
-    // stepgen_stop_s_curve_dma(10.0f, 128u);
+    // stepgen_stop_s_curve_dma(&motor1, 10.0f, 128u);
 
     // El PIO + DMA se encargan de todo; el CPU puede dormir o hacer otras tareas
     while (true) {
